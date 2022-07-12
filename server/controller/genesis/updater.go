@@ -19,13 +19,10 @@ package genesis
 import (
 	"context"
 	"fmt"
+	"inet.af/netaddr"
 	"strconv"
 	"strings"
 	"time"
-
-	"inet.af/netaddr"
-
-	uuid "github.com/satori/go.uuid"
 
 	tridentcommon "github.com/deepflowys/deepflow/message/common"
 	"github.com/deepflowys/deepflow/message/trident"
@@ -33,7 +30,14 @@ import (
 	genesiscommon "github.com/deepflowys/deepflow/server/controller/genesis/common"
 	"github.com/deepflowys/deepflow/server/controller/model"
 	"github.com/deepflowys/deepflow/server/libs/queue"
+	uuid "github.com/satori/go.uuid"
 )
+
+type bridge struct {
+	name string
+	uuid string
+	vlan int
+}
 
 type GenesisSyncRpcUpdater struct {
 	vCtx                  context.Context
@@ -357,6 +361,276 @@ func (v *GenesisSyncRpcUpdater) ParseHostAsVmPlatformInfo(info *trident.GenesisP
 		Ports:       NewPortPlatformDataOperation(ports),
 		Networks:    NewNetworkPlatformDataOperation(networks),
 		IPlastseens: NewIPLastSeenPlatformDataOperation(ipLastSeens),
+	}
+}
+
+func (v *GenesisSyncRpcUpdater) ParseKVMPlatformInfo(info *trident.GenesisPlatformData, peer string) GenesisSyncDataOperation {
+	rawVM := strings.Trim(info.GetRawAllVmXml(), " ")
+	rawOVSInterface := strings.Trim(info.GetRawOvsInterfaces(), " ")
+	rawOVSPorts := strings.Trim(info.GetRawOvsPorts(), " ")
+	ovsMode := false
+	if rawOVSPorts != "" {
+		ovsMode = true
+	}
+	rawHostName := strings.Trim(info.GetRawHostname(), " ")
+	rawVMStates := strings.Trim(info.GetRawVmStates(), " ")
+	rawBrctlShow := strings.Trim(info.GetRawBrctlShow(), " ")
+	rawVlanConfig := strings.Trim(info.GetRawVlanConfig(), " ")
+	tIPs := info.GetIps()
+	if ovsMode {
+		rawBrctlShow = ""
+		rawVlanConfig = ""
+	}
+
+	hosts := []model.GenesisHost{
+		model.GenesisHost{
+			Hostname: rawHostName,
+			IP:       peer,
+		},
+	}
+
+	vpcIDToName := map[string]string{}
+	networkIDToNetwork := map[string]model.GenesisNetwork{}
+	macToPort := map[string]map[string]string{}
+	portToBridge := map[string]bridge{}
+	vms := []model.GenesisVM{}
+	vpcs := []model.GenesisVpc{}
+	ports := []model.GenesisPort{}
+	networks := []model.GenesisNetwork{}
+	ipLastSeens := []model.GenesisIP{}
+
+	pCSVkeys := []string{"_uuid", "other_config", "tag"}
+	nameToOvsPort, err := genesiscommon.ParseCSVWithKey(rawOVSPorts, "name", pCSVkeys...)
+	if err != nil {
+		log.Warning("parse csv with key failed: " + err.Error())
+	}
+	pCSVs := []string{"name", "external_ids"}
+	nameToOvsIfs, err := genesiscommon.ParseCSV(rawOVSInterface, pCSVs...)
+	if err != nil {
+		log.Warning("parse csv failed: " + err.Error())
+	}
+	for _, nameToOvsIf := range nameToOvsIfs {
+		name, ok := nameToOvsIf["name"]
+		if !ok {
+			continue
+		}
+		eIDs, err := genesiscommon.ParseKVString(nameToOvsIf["external_ids"])
+		if err != nil {
+			log.Warning("parse kvstring failed: " + err.Error())
+		}
+		mac, ok := eIDs["attached-mac"]
+		if !ok {
+			log.Debugf("ovs interface %s does not have external_ids:attached-mac", name)
+			continue
+		}
+		if ovsPort, ok := nameToOvsPort[name]; ok {
+			macToPort[mac] = ovsPort
+		}
+	}
+	if !ovsMode {
+		bridges, err := genesiscommon.ParseBrctlShow(rawBrctlShow)
+		if err != nil {
+			log.Warning("parse brctl show failed: " + err.Error())
+		}
+		vlanConfig, err := genesiscommon.ParseVLANConfig(rawVlanConfig)
+		if err != nil {
+			log.Warning("parse vlan config failed: " + err.Error())
+		}
+		for br, ifaces := range bridges {
+			vlan := 1
+			for _, iface := range ifaces {
+				if v, ok := vlanConfig[iface]; ok {
+					vlan = v
+					break
+				}
+			}
+			bge := bridge{
+				name: br,
+				uuid: common.GetUUID(fmt.Sprintf("%d,%s", vlan, br), uuid.Nil),
+				vlan: vlan,
+			}
+			for _, iface := range ifaces {
+				portToBridge[iface] = bge
+			}
+		}
+	}
+
+	macToIPs := map[string][]model.GenesisIP{}
+	macToIsExternalIP := map[string]bool{}
+	for _, tIP := range tIPs {
+		ip := model.GenesisIP{}
+		tIPStr := string(tIP.GetIp())
+		ipObj, err := netaddr.ParseIP(tIPStr)
+		if err != nil {
+			log.Warning("invalid ip address found: " + tIPStr)
+			continue
+		}
+		ip.IP = ipObj.String()
+		tIPLastSeen := tIP.GetLastSeen()
+		ip.LastSeen = time.Unix(int64(tIPLastSeen), 0).Local()
+		ipLastSeens = append(ipLastSeens, ip)
+		macStr := genesiscommon.Uint64ToMac(tIP.GetMac()).String()
+		if _, ok := macToIPs[macStr]; ok {
+			macToIPs[macStr] = append(macToIPs[macStr], ip)
+		} else {
+			macToIPs[macStr] = []model.GenesisIP{ip}
+		}
+		cFlag := false
+		for _, l := range v.localIPRanges {
+			if !l.Contains(ipObj) {
+				cFlag = true
+			}
+		}
+		macToIsExternalIP[macStr] = cFlag
+	}
+
+	vmStates, err := genesiscommon.ParseVMStates(rawVMStates)
+	if err != nil {
+		log.Warning("parse vm states failed: " + err.Error())
+	}
+	xmlVMs, err := genesiscommon.ParseVMXml(rawVM)
+	if err != nil {
+		log.Warning("parse vm xml failed: " + err.Error())
+	}
+	for _, xmlVM := range xmlVMs {
+		vm := model.GenesisVM{}
+		vm.Lcuuid = xmlVM.UUID
+		vm.Name = xmlVM.Name
+		vm.Label = xmlVM.Label
+		if xmlVM.VPC.Name != "" && xmlVM.VPC.UUID != "" {
+			vm.VPCLcuuid = xmlVM.VPC.UUID
+			vpcIDToName[xmlVM.VPC.UUID] = xmlVM.VPC.Name
+		}
+		vm.LaunchServer = peer
+		state, ok := vmStates[xmlVM.Label]
+		if ok {
+			vm.State = uint32(state)
+		} else {
+			vm.State = uint32(common.VM_STATE_EXCEPTION)
+		}
+		vms = append(vms, vm)
+
+		if vm.State != uint32(common.VM_STATE_RUNNING) {
+			// 不处理非运行状态虚拟机的接口
+			continue
+		}
+
+		for _, xmlIf := range xmlVM.Interfaces {
+			port := model.GenesisPort{}
+			network := model.GenesisNetwork{}
+			mac := xmlIf.Mac
+			ifName := xmlIf.Target
+			if ovsMode {
+				portMap := map[string]string{}
+				if mP, ok := macToPort[mac]; ok {
+					portMap = mP
+				} else if oP, ok := nameToOvsPort[ifName]; ok {
+					portMap = oP
+				} else {
+					log.Debugf("vm %s interface %s mac %s not found in ovs ports", vm.Label, ifName, mac)
+					continue
+				}
+				port.Lcuuid = portMap["_uuid"]
+				options, err := genesiscommon.ParseKVString(portMap["other_config"])
+				if err != nil {
+					log.Warning("parse kv string failed: " + err.Error())
+				}
+				if nLcuuid, ok := options["net_uuid"]; ok {
+					network.Lcuuid = nLcuuid
+				} else {
+					// tag不为数字时均默认为1
+					tagInt, err := strconv.Atoi(portMap["tag"])
+					if err != nil {
+						tagInt = 1
+					}
+					network.Lcuuid = common.GetUUID(strconv.Itoa(tagInt), uuid.Nil)
+				}
+				if sID, ok := options["segmentation_id"]; ok {
+					sIDInt, err := strconv.Atoi(sID)
+					if err != nil {
+						sIDInt = 1
+					}
+					network.SegmentationID = uint32(sIDInt)
+				} else {
+					tagInt, err := strconv.Atoi(portMap["tag"])
+					if err != nil {
+						tagInt = 1
+					}
+					network.SegmentationID = uint32(tagInt)
+				}
+			} else {
+				br, ok := portToBridge[ifName]
+				if !ok {
+					br = bridge{
+						uuid: common.GetUUID("yunshan-temp", uuid.Nil),
+						vlan: 1,
+					}
+				}
+				port.Lcuuid = common.GetUUID(mac, uuid.Nil)
+				network.Lcuuid = br.uuid
+				network.SegmentationID = uint32(br.vlan)
+			}
+			isExternal := macToIsExternalIP[mac]
+			network.NetType = uint32(common.NETWORK_TYPE_LAN)
+			port.Type = uint32(common.VIF_TYPE_LAN)
+			if isExternal {
+				network.NetType = uint32(common.NETWORK_TYPE_WAN)
+				port.Type = uint32(common.VIF_TYPE_WAN)
+			}
+			network.External = isExternal
+			network.VPCLcuuid = vm.VPCLcuuid
+			networkIDToNetwork[network.Lcuuid] = network
+			port.Mac = mac
+			port.DeviceLcuuid = vm.Lcuuid
+			port.NetworkLcuuid = network.Lcuuid
+			port.VPCLcuuid = vm.VPCLcuuid
+			ports = append(ports, port)
+			for _, ip := range macToIPs[mac] {
+				ip.VinterfaceLcuuid = port.Lcuuid
+				ip.Lcuuid = common.GetUUID(ip.IP+ip.VinterfaceLcuuid, uuid.Nil)
+			}
+		}
+	}
+
+	// 滤掉没有对应到port的ip
+	ips := []model.GenesisIP{}
+	for _, ipLS := range ipLastSeens {
+		if ipLS.Lcuuid != "" {
+			ips = append(ips, ipLS)
+		}
+	}
+
+	for _, n := range networkIDToNetwork {
+		networks = append(networks, n)
+	}
+	for id, name := range vpcIDToName {
+		vpc := model.GenesisVpc{}
+		vpc.Lcuuid = id
+		vpc.Name = name
+		vpcs = append(vpcs, vpc)
+	}
+
+	lldps := []model.GenesisLldp{}
+	for _, l := range info.GetLldpInfo() {
+		lldp := model.GenesisLldp{}
+		lldp.Lcuuid = common.GetUUID(peer+l.GetManagementAddress()+l.GetPortId(), uuid.Nil)
+		lldp.HostIP = peer
+		lldp.HostInterface = l.GetInterface()
+		lldp.SystemName = l.GetSystemName()
+		lldp.ManagementAddress = l.GetManagementAddress()
+		lldp.VinterfaceLcuuid = l.GetPortId()
+		lldp.VinterfaceDescription = l.GetPortDescription()
+		lldps = append(lldps, lldp)
+	}
+
+	return GenesisSyncDataOperation{
+		Hosts:       NewHostPlatformDataOperation(hosts),
+		VMs:         NewVMPlatformDataOperation(vms),
+		VPCs:        NewVpcPlatformDataOperation(vpcs),
+		Networks:    NewNetworkPlatformDataOperation(networks),
+		Ports:       NewPortPlatformDataOperation(ports),
+		IPlastseens: NewIPLastSeenPlatformDataOperation(ips),
+		Lldps:       NewLldpInfoPlatformDataOperation(lldps),
 	}
 }
 

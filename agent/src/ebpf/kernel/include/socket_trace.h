@@ -129,11 +129,16 @@ struct conn_info_t {
 	struct socket_info_t *socket_info_ptr; /* lookup __socket_info_map */
 };
 
+enum process_data_extra_source {
+	DATA_SOURCE_SYSCALL,
+	DATA_SOURCE_GO_TLS_UPROBE,
+	DATA_SOURCE_GO_HTTP2_UPROBE,
+};
+
 struct process_data_extra {
 	bool vecs : 1;
-	bool go : 1;
-	bool tls : 1;
-	bool use_tcp_seq : 1;
+	enum process_data_extra_source source;
+	enum traffic_protocol protocol;
 	__u32 tcp_seq;
 	__u64 coroutine_id;
 };
@@ -238,7 +243,7 @@ static __inline __u64 gen_conn_key_id(__u64 param_1, __u64 param_2)
 
 struct go_interface
 {
-	long long type;
+	unsigned long long type;
 	void *ptr;
 };
 

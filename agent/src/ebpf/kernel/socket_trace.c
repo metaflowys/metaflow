@@ -717,9 +717,10 @@ data_submit(struct pt_regs *ctx, struct conn_info_t *conn_info,
 	}
 
 	// ignore non-http protocols that are go tls
-	if (extra->go && extra->tls) {
-		if (conn_info->protocol != PROTO_HTTP1)
+	if (extra->source == DATA_SOURCE_GO_TLS_UPROBE) {
+		if (conn_info->protocol != PROTO_HTTP1){
 			return;
+		}
 	}
 
 	if (conn_info->sk == NULL || conn_info->message_type == MSG_UNKNOWN) {
@@ -841,6 +842,7 @@ data_submit(struct pt_regs *ctx, struct conn_info_t *conn_info,
 		}
 	}
 
+	// TODO: 从这里开始往下的逻辑单独抽象出一个函数
 	struct __socket_data_buffer *v_buff = bpf_map_lookup_elem(&NAME(data_buf), &k0);
 	if (!v_buff)
 		return;
@@ -859,8 +861,8 @@ data_submit(struct pt_regs *ctx, struct conn_info_t *conn_info,
 	v->tuple.num = conn_info->tuple.num;
 	v->data_type = conn_info->protocol;
 
-	if (conn_info->protocol == PROTO_HTTP1 && extra->go && extra->tls)
-		v->data_type = PROTO_GO_TLS_HTTP1;
+	if (conn_info->protocol == PROTO_HTTP1 && extra->source == DATA_SOURCE_GO_TLS_UPROBE)
+		v->data_type = PROTO_TLS_HTTP1;
 
 	v->socket_id = sk_info.uid;
 	v->data_seq = sk_info.seq;
@@ -885,10 +887,11 @@ data_submit(struct pt_regs *ctx, struct conn_info_t *conn_info,
 	} else
 		v->extra_data_count = 0;
 
-	if (extra->use_tcp_seq)
+	if (extra->source == DATA_SOURCE_GO_TLS_UPROBE)
 		v->tcp_seq = extra->tcp_seq;
 
 	v->coroutine_id = extra->coroutine_id;
+	v->source = extra->source;
 	/*
 	 * the bitwise AND operation will set the range of possible values for
 	 * the UNKNOWN_VALUE register to [0, BUFSIZE)
@@ -986,6 +989,15 @@ static __inline void process_data(struct pt_regs *ctx, __u64 id,
 	}
 
 	init_conn_info(tgid, args->fd, &__conn_info, sk);
+
+	// TODO: 从这里截断
+	// 后面的协议推断和 data_submit 里的追踪对于 http2 uprobe 都是冗余逻辑
+	// 然后实现类似 data_submit 的逻辑,主要是去调整 v_buffer
+	if (extra->source == DATA_SOURCE_GO_HTTP2_UPROBE){
+		// 这里必须用一个函数,绕开这一坨的实现
+		return;
+	}
+
 	conn_info->direction = direction;
 
 	if (!extra->vecs) {
@@ -1010,7 +1022,10 @@ static __inline void process_data(struct pt_regs *ctx, __u64 id,
 static __inline void process_syscall_data(struct pt_regs* ctx, __u64 id,
 					  const enum traffic_direction direction,
 					  const struct data_args_t* args, ssize_t bytes_count) {
-	struct process_data_extra extra = {};
+	struct process_data_extra extra = {
+		.vecs = false,
+		.source = DATA_SOURCE_SYSCALL,
+	};
 	process_data(ctx, id, direction, args, bytes_count, &extra);
 
 }
@@ -1021,17 +1036,9 @@ static __inline void process_syscall_data_vecs(struct pt_regs* ctx, __u64 id,
 					       ssize_t bytes_count) {
 	struct process_data_extra extra = {
 		.vecs = true,
+		.source = DATA_SOURCE_SYSCALL,
 	};
 	process_data(ctx, id, direction, args, bytes_count, &extra);
-}
-
-static __inline void
-process_uprobe_data_tls(struct pt_regs *ctx, __u64 id,
-			const enum traffic_direction direction,
-			const struct data_args_t *args, ssize_t bytes_count,
-			struct process_data_extra *extra)
-{
-	process_data(ctx, id, direction, args, bytes_count, extra);
 }
 
 /***********************************************************
@@ -1090,7 +1097,10 @@ TPPROG(sys_exit_read) (struct syscall_comm_exit_ctx *ctx) {
 	struct data_args_t* read_args = active_read_args_map__lookup(&id);
 	// Don't process FD 0-2 to avoid STDIN, STDOUT, STDERR.
 	if (read_args != NULL && read_args->fd > 2) {
-		struct process_data_extra extra = {};
+		struct process_data_extra extra = {
+			.vecs = false,
+			.source = DATA_SOURCE_SYSCALL,
+		};
 		process_data((struct pt_regs *)ctx, id, T_INGRESS, read_args,
 			     bytes_count, &extra);
 	}
@@ -1482,5 +1492,6 @@ TPPROG(sys_exit_socket) (struct syscall_comm_exit_ctx *ctx) {
 
 //Refer to the eBPF programs here
 #include "go_tls_bpf.c"
+#include "go_http2_bpf.c"
 
 char _license[] SEC("license") = "GPL";

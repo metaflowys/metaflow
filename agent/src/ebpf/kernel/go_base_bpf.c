@@ -3,14 +3,14 @@
 /*
  * The binary executable file offset of the GO process
  * key: pid
- * value: struct member_offsets
+ * value: struct ebpf_proc_info
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, int);
-	__type(value, struct member_offsets);
+	__type(value, struct ebpf_proc_info);
 	__uint(max_entries, HASH_ENTRIES_MAX);
-} go_offsets_map SEC(".maps");
+} proc_info_map SEC(".maps");
 
 /*
  * Goroutines Map
@@ -24,17 +24,22 @@ struct {
 	__uint(max_entries, MAX_SYSTEM_THREADS);
 } goroutines_map SEC(".maps");
 
-static __inline int get_uprobe_offset(int offset_idx)
+static __inline struct ebpf_proc_info *get_current_proc_info()
 {
 	__u64 id;
 	pid_t pid;
 
 	id = bpf_get_current_pid_tgid();
 	pid = id >> 32;
-	struct member_offsets *offsets;
-	offsets = bpf_map_lookup_elem(&go_offsets_map, &pid);
-	if (offsets) {
-		return offsets->data[offset_idx];
+	struct ebpf_proc_info *info = bpf_map_lookup_elem(&proc_info_map, &pid);
+	return info;
+}
+
+static __inline int get_uprobe_offset(int offset_idx)
+{
+	struct ebpf_proc_info *info = get_current_proc_info();
+	if (info) {
+		return info->offsets[offset_idx];
 	}
 
 	return -1;
@@ -47,10 +52,10 @@ static __inline __u32 get_go_version(void)
 
 	id = bpf_get_current_pid_tgid();
 	pid = id >> 32;
-	struct member_offsets *offsets;
-	offsets = bpf_map_lookup_elem(&go_offsets_map, &pid);
-	if (offsets) {
-		return offsets->version;
+	struct ebpf_proc_info *info;
+	info = bpf_map_lookup_elem(&proc_info_map, &pid);
+	if (info) {
+		return info->version;
 	}
 
 	return 0;
@@ -58,17 +63,17 @@ static __inline __u32 get_go_version(void)
 
 static __inline int get_runtime_g_goid_offset(void)
 {
-	return get_uprobe_offset(runtime_g_goid_offset);
+	return get_uprobe_offset(OFFSET_IDX_GOID_RUNTIME_G);
 }
 
 static __inline int get_crypto_tls_conn_conn_offset(void)
 {
-	return get_uprobe_offset(crypto_tls_conn_conn_offset);
+	return get_uprobe_offset(OFFSET_IDX_CONN_TLS_CONN);
 }
 
 static __inline int get_net_poll_fd_sysfd(void)
 {
-	return get_uprobe_offset(net_poll_fd_sysfd);
+	return get_uprobe_offset(OFFSET_IDX_SYSFD_POLL_FD);
 }
 
 static __inline __s64 get_current_goroutine(void)
@@ -80,6 +85,80 @@ static __inline __s64 get_current_goroutine(void)
 	}
 
 	return 0;
+}
+
+static __inline bool is_tcp_conn_interface(void *conn)
+{
+	struct go_interface i;
+	bpf_probe_read_user(&i, sizeof(i), conn);
+
+	struct ebpf_proc_info *info = get_current_proc_info();
+	return info ? i.type == info->net_TCPConn_itab : false;
+}
+
+static __inline int get_fd_from_tcp_conn_interface(void *conn)
+{
+	if (!is_tcp_conn_interface(conn)) {
+		return -1;
+	}
+
+	int offset_fd_sysfd = get_net_poll_fd_sysfd();
+	if (offset_fd_sysfd < 0)
+		return -1;
+
+	struct go_interface i = {};
+	void *ptr;
+	int fd;
+
+	bpf_probe_read_user(&i, sizeof(i), conn);
+	bpf_probe_read_user(&ptr, sizeof(ptr), i.ptr);
+	bpf_probe_read_user(&fd, sizeof(fd), ptr + offset_fd_sysfd);
+	return fd;
+}
+
+static __inline int get_fd_from_tls_conn_struct(void *conn)
+{
+	int offset_conn_conn = get_crypto_tls_conn_conn_offset();
+	if (offset_conn_conn < 0)
+		return -1;
+
+	return get_fd_from_tcp_conn_interface(conn + offset_conn_conn);
+}
+
+static __inline bool is_tls_conn_interface(void *conn)
+{
+	struct go_interface i;
+	bpf_probe_read_user(&i, sizeof(i), conn);
+
+	struct ebpf_proc_info *info = get_current_proc_info();
+	return info ? i.type == info->crypto_tls_Conn_itab : false;
+}
+
+static __inline int get_fd_from_tls_conn_interface(void *conn)
+{
+	if (!is_tls_conn_interface(conn)) {
+		return -1;
+	}
+	struct go_interface i = {};
+
+	bpf_probe_read_user(&i, sizeof(i), conn);
+	return get_fd_from_tls_conn_struct(i.ptr);
+}
+
+static __inline int get_fd_from_tcp_or_tls_conn_interface(void *conn)
+{
+	int fd;
+	fd = get_fd_from_tls_conn_interface(conn);
+	if (fd > 0) {
+		// TODO: 标记 http2 使用了 tls 加密
+		return fd;
+	}
+	fd = get_fd_from_tcp_conn_interface(conn);
+	if (fd > 0) {
+		// TODO: 标记 http2 没有通过 tls 加密
+		return fd;
+	}
+	return -1;
 }
 
 SEC("uprobe/runtime.casgstatus")
@@ -125,9 +204,9 @@ int bpf_func_sched_process_exit(struct sched_comm_exit_ctx *ctx)
 	pid = id >> 32;
 	tid = (__u32)id;
 
-	// If is a process, clear go_offsets_map element and submit event.
+	// If is a process, clear proc_info_map element and submit event.
 	if (pid == tid) {
-		bpf_map_delete_elem(&go_offsets_map, &pid);
+		bpf_map_delete_elem(&proc_info_map, &pid);
 		struct event_data data;
 		data.pid = pid;
 		data.event_type = EVENT_TYPE_PROC_EXIT;
@@ -136,11 +215,10 @@ int bpf_func_sched_process_exit(struct sched_comm_exit_ctx *ctx)
 						sizeof(data));
 
 		if (ret) {
-			bpf_debug
-			    ("bpf_func_sched_process_exit event outputfaild: %d\n",
-			     ret);
+			bpf_debug(
+				"bpf_func_sched_process_exit event outputfaild: %d\n",
+				ret);
 		}
-
 	}
 
 	bpf_map_delete_elem(&goroutines_map, &id);
@@ -154,7 +232,7 @@ int bpf_func_sched_process_exec(struct sched_comm_exec_ctx *ctx)
 	struct event_data data;
 	__u64 id = bpf_get_current_pid_tgid();
 	pid_t pid = id >> 32;
-	pid_t tid = (__u32) id;
+	pid_t tid = (__u32)id;
 
 	if (pid == tid) {
 		data.event_type = EVENT_TYPE_PROC_EXEC;
@@ -164,9 +242,9 @@ int bpf_func_sched_process_exec(struct sched_comm_exec_ctx *ctx)
 						sizeof(data));
 
 		if (ret) {
-			bpf_debug
-			    ("bpf_func_sys_exit_execve event output() faild: %d\n",
-			     ret);
+			bpf_debug(
+				"bpf_func_sys_exit_execve event output() faild: %d\n",
+				ret);
 		}
 	}
 

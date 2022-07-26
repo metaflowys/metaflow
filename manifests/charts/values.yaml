@@ -1,0 +1,140 @@
+global:
+  dnsPolicy: ClusterFirstWithHostNet
+  hostNetwork: "true"
+  # nodePort: 
+  #   clickhouse: 
+  #   deepflowServerIngester: 
+  #   deepflowServerGrpc: 
+  #   deepflowServerSslGrpc: 
+  #   deepflowServerhealthCheck: 
+configmap:
+  ## no blank lines
+  ## 不要有空行
+  server.yaml: |
+    controller:
+      ## logfile path
+      log-file: /var/log/deepflow/server.log
+      ## loglevel: "debug/info/warn/error"
+      log-level: info
+      listen-port: 20417
+      ## mysql config
+      mysql:
+        database: deepflow
+        user-name: root
+        user-password: {{ .Values.global.password.mysql }}
+        host: {{ $.Release.Name }}-mysql
+        port: 30130
+        timeout: 30
+      ## clickhouse config
+      clickhouse:
+        database: flow_tag
+        user: default
+        port: 9000
+        timeout: 60
+        host: {{ $.Release.Name }}-clickhouse
+      ## roze
+      roze:
+        port: 20106
+        timeout: 60
+      ## Specification related Definition
+      spec:
+        vtap_group_max: 1000
+        vtap_max_per_group: 10000
+        az_max_per_server: 10
+        data_source_max: 10
+        data_source_retention_time_max: 1000
+      monitor:
+        ## Controller and data node check Interval (unit: second)
+        health_check_interval: 60
+        ## Health check exception/Controller switchover process channel length
+        health_check_handle_channel_len: 1000
+        ## License check interval (unit: second)
+        license_check_interval: 60
+        ## warrant
+        warrant:
+          host: warrant
+          port: 20413
+          timeout: 30
+      manager:
+        ## Interval for cloud platform to add/delete/configure change detection (unit: second)
+        cloud_config_check_interval: 20
+        ## task module config
+        task:
+          ## Recorder Database update interval, unit: second
+          resource_recorder_interval: 20
+        cloud:
+          ## Kubernetes Interval for data acquisition, in seconds
+          kubernetes_gather_interval: 20
+          ## When ali Public Cloud API obtains the region list, it needs to specify a region
+          aliyun_region_name: cn-beijing
+        recorder:
+          ## Recorder module cache self-healing refresh interval, unit: minute
+          cache_refresh_interval: 3600
+      trisolaris:
+        tsdb_ip:
+        chrony:
+          host: {{ tpl .Values.global.ntpServer . }}
+          port: 123
+          timeout: 1
+        # - 127.0.0.1
+        trident-port: 20035
+        max-escape-seconds: 3600
+        trident-type-for-unkonw-vtap: {{ .Values.config.tridentTypeForUnkonwVtap }}
+        platform-vips:
+        #  - 55.11.135.18
+        node-type: "master"
+        ## grpc max message lenth default 100M
+        grpc-max-message-length: 104857600
+        region-domain-prefix: ""
+      genesis:
+        aging_time: 86400
+        vinterface_aging_time: 300
+        grpc_server_port: 20035
+        exclude_ip_ranges: []
+        queue_length: 1000
+        data_persistence_interval: 60
+    querier:
+      # logfile path
+      log-file: /var/log/deepflow/server.log
+      # loglevel: "debug/info/warn/error"
+      log-level: info
+      # querier http listenport
+      listen-port: 20416
+      # clickhouse config
+      clickhouse:
+        database: flow_tag
+        user: default
+        port: 9000
+        timeout: 60
+        host: {{ $.Release.Name }}-clickhouse
+    ingester:
+      ckdb-service-prefix: {{ $.Release.Name }}-clickhouse-headless
+  app.yaml: |
+    app:
+      # logfile path
+      log-file: /var/log/deepflow/app.log
+      # loglevel: "debug/info/warn/error"
+      log-level: info
+      # app http listenport
+      listen-port: 20418
+      # http request/response timeout
+      http_request_timeout: 600
+      http_response_timeout: 600
+      querier:
+        host: {{ include "deepflow.fullname" . }}-server
+        port: 20416
+        timeout: 60
+      controller:
+        host: {{ include "deepflow.fullname" . }}-server
+        port: 20417
+        timeout: 60
+      spec:
+        l7_tracing_limit: 100
+deepflow-agent:
+  deepflowAgentConfig: 
+    deepflow-agent.yaml: |
+      controller-ips:
+      {{- tpl (toYaml $.Values.deepflowServerNodeIPS ) .| nindent 4 }}
+      {{ if .Values.agentGroupID }}vtap-group-id-request: {{ .Values.agentGroupID }}{{ end }}
+      {{ if .Values.deepflowK8sClusterID }}kubernetes-cluster-id: {{ .Values.deepflowK8sClusterID }}{{ end }}
+      controller-port: 20035

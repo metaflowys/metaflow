@@ -156,6 +156,42 @@ static __inline int get_fd_from_grpc_loopyWriter(struct pt_regs *ctx)
 	return get_fd_from_tcp_or_tls_conn_interface(ptr);
 }
 
+struct go_http2_header_field {
+	struct go_string name;
+	struct go_string value;
+	bool sensitive;
+};
+
+// golang.org/x/net/http2/hpack.dynamicTable
+static __inline int update_dynamic_table(void *ptr)
+{
+struct go_slice ents;
+	bpf_probe_read_user(&ents, sizeof(ents), ptr);
+	bpf_debug("ents len=[%d], cap=[%d]\n", ents.len, ents.cap);
+
+	static const int field_max = 50;
+	int field_idx = 0;
+	struct go_http2_header_field field;
+
+#pragma unroll
+	for (field_idx = 0; field_idx < field_max; ++field_idx) {
+		if (field_idx < ents.len) {
+			bpf_probe_read_user(&field, sizeof(field), ents.ptr + field_idx * sizeof(struct go_http2_header_field));
+			// 通过字符串的 len 确定了这些就是动态表的数组,且 field 就是动态表中的一项
+			// 后面需要把这些东西根据长度读出来放到一个大的 buffer 里传上去
+			bpf_debug("field name len=[%d], value len=[%d]\n", field.name.len, field.value.len);
+		}
+	}
+
+	ptr += get_uprobe_offset(OFFSET_IDX_EVICT_COUNT_HPACK_HEADER_FIELD_TABLE);
+	__u64 evictCount;
+	bpf_probe_read_user(&evictCount, sizeof(evictCount), ptr);
+	bpf_debug("evictCount=[%d]\n", evictCount);
+	return 0;
+}
+
+
+
 // type http2clientConnReadLoop struct {
 //	_  http2incomparable
 //	cc *http2ClientConn
@@ -212,6 +248,19 @@ int uprobe_go_http2clientConnReadLoop_handleResponse(struct pt_regs *ctx)
 	return 0;
 }
 
+static void *get_dynamic_table_from_http2ClientConn_ctx(struct pt_regs *ctx)
+{
+	void *ptr;
+	if (get_go_version() >= GO_VERSION(1, 17, 0)) {
+		ptr = (void *)ctx->rax;
+	} else {
+		bpf_probe_read(&ptr, sizeof(ptr), (void *)(ctx->rsp + 8));
+	}
+	ptr += get_uprobe_offset(OFFSET_IDX_HENC_HTTP2_CLIENT_CONN);
+	bpf_probe_read_user(&ptr, sizeof(ptr), ptr);
+	return ptr;
+}
+
 SEC("uprobe/go_http2ClientConn_writeHeaders")
 int uprobe_go_http2ClientConn_writeHeaders(struct pt_regs *ctx)
 {
@@ -220,6 +269,9 @@ int uprobe_go_http2ClientConn_writeHeaders(struct pt_regs *ctx)
 	bpf_debug("1. http2ClientConn writeHeaders fd=[%d] tcp_seq=[%u]\n", fd,
 		  tcp_seq);
 
+	// 在这里把动态表打印出来
+	void *ptr=get_dynamic_table_from_http2ClientConn_ctx(ctx);
+	update_dynamic_table(ptr);
 	// TODO: Implement hook function
 	return 0;
 }
@@ -229,6 +281,8 @@ int uprobe_go_http2ClientConn_writeHeaders(struct pt_regs *ctx)
 SEC("uprobe/go_http2ClientConn_writeHeader")
 int uprobe_go_http2ClientConn_writeHeader(struct pt_regs *ctx)
 {
+	// 看样子不需要这个hook点,临时屏蔽掉
+	return 0;
 	int fd = get_fd_from_http2ClientConn_ctx(ctx);
 	int tcp_seq = get_tcp_write_seq_from_fd(fd);
 	bpf_debug("0. http2ClientConn writeHeader fd=[%d] tcp_seq=[%u]\n", fd,

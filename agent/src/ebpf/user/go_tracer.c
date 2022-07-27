@@ -120,6 +120,18 @@ struct data_members offsets[] = {
 		.idx = OFFSET_IDX_SIDE_GRPC_TRANSPORT_LOOPY_WRITER,
 		.default_offset = 0,
 	},
+	{
+		.structure = "net/http.http2ClientConn",
+		.field_name = "henc",
+		.idx = OFFSET_IDX_HENC_HTTP2_CLIENT_CONN,
+		.default_offset = 368,
+	},
+	{
+		.structure = "vendor/golang.org/x/net/http2/hpack.headerFieldTable",
+		.field_name = "evictCount",
+		.idx = OFFSET_IDX_EVICT_COUNT_HPACK_HEADER_FIELD_TABLE,
+		.default_offset = 24,
+	},
 };
 
 static struct symbol syms[] = {

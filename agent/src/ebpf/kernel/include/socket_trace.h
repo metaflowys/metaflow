@@ -241,18 +241,27 @@ static __inline __u64 gen_conn_key_id(__u64 param_1, __u64 param_2)
 
 #define MAX_SYSTEM_THREADS 40960
 
-struct go_interface
-{
+struct go_interface {
 	unsigned long long type;
 	void *ptr;
 };
 
-struct tls_conn
-{
+struct go_slice {
+	void *ptr;
+	unsigned long long len;
+	unsigned long long cap;
+};
+
+struct go_string {
+	const char *ptr;
+	unsigned long long len;
+};
+
+struct tls_conn {
 	int fd;
 	char *buffer;
 	__u32 tcp_seq;
-	void* sp; // stack pointer
+	void *sp; // stack pointer
 };
 
 struct tls_conn_key

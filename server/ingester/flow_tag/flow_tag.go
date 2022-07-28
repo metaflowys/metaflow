@@ -85,7 +85,7 @@ func NewTagField(time uint32, db, table string, epcId int32, podNsId uint16, fie
 	t.TableName = fmt.Sprintf("%s_%s", db, TagField.String())
 	t.table = table
 	t.fieldType = fieldType
-	t.epcId = epcId
+	t.vpcId = epcId
 	t.podNsId = podNsId
 	t.fieldName = fieldName
 	if fieldType == FieldTag {

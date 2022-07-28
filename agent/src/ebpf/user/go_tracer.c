@@ -132,6 +132,30 @@ struct data_members offsets[] = {
 		.idx = OFFSET_IDX_EVICT_COUNT_HPACK_HEADER_FIELD_TABLE,
 		.default_offset = 24,
 	},
+	{
+		.structure = "net/http.http2ClientConn",
+		.field_name = "fr",
+		.idx = OFFSET_IDX_FR_HTTP2_CLIENT_CONN,
+		.default_offset = 304,
+	},
+	{
+		.structure = "net/http.http2Framer",
+		.field_name = "ReadMetaHeaders",
+		.idx = OFFSET_IDX_READ_META_HEADERS_HTTP2_FRAMER,
+		.default_offset = 168,
+	},
+	{
+		.structure = "net/http.http2serverConn",
+		.field_name = "framer",
+		.idx = OFFSET_IDX_FRAMER_HTTP2_CLIENT_CONN,
+		.default_offset = 72,
+	},
+	{
+		.structure = "net/http.http2serverConn",
+		.field_name = "hpackEncoder",
+		.idx = OFFSET_IDX_HPACK_ENCODER_HTTP2_CLIENT_CONN,
+		.default_offset = 72,
+	},
 };
 
 static struct symbol syms[] = {

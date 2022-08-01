@@ -19,7 +19,7 @@ controller:
     user-name: root
     user-password: deepflow
     host: mysql
-    port: 30130
+    port: 3306
     timeout: 30
 
   # redis相关配置

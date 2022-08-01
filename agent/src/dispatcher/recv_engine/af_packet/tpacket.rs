@@ -23,9 +23,11 @@ use libc::{
 };
 use log::warn;
 use pcap_sys::{bpf_program, pcap_compile_nopcap};
+use public::error::*;
+use public::packet;
 use socket::{self, Socket};
 
-use super::{header, options, Error, Result};
+use super::{header, options};
 
 use crate::utils::{
     net::{self, link_by_name},
@@ -83,24 +85,15 @@ pub struct Tpacket {
 // it's safe because ring points to mmap'ed buffer
 unsafe impl Send for Tpacket {}
 
-#[derive(Debug)]
-pub struct Packet<'a> {
-    pub timestamp: Duration,
-    pub if_index: isize,
-    pub capture_length: isize,
-
-    pub data: &'a mut [u8],
-}
-
 impl Tpacket {
-    fn bind(&self) -> Result<()> {
+    fn bind(&self) -> af_packet::Result<()> {
         let mut if_index: i32 = 0;
 
         if self.opts.iface != "" {
             // 根据网卡名称获取网卡if_index
             let link = link_by_name(self.opts.iface.clone()).map_err(|e| match e {
-                net::Error::LinkNotFound(s) => Error::LinkError(s),
-                net::Error::NetLinkError(ne) => Error::LinkError(ne.to_string()),
+                net::Error::LinkNotFound(s) => af_packet::Error::LinkError(s),
+                net::Error::NetLinkError(ne) => af_packet::Error::LinkError(ne.to_string()),
                 _ => unreachable!(),
             })?;
             if_index = link.if_index as i32;
@@ -160,11 +153,13 @@ impl Tpacket {
             self.tp_version = options::OptTpacketVersion::TpacketVersion2;
             Ok(())
         } else {
-            Err(Error::InvalidTpVersion(self.tp_version as isize))
+            Err(public::error::Error::AfPacketError(
+                af_packet::Error::InvalidTpVersion(self.tp_version as isize),
+            ))
         }
     }
 
-    fn set_ring(&self) -> Result<()> {
+    fn set_ring(&self) -> af_packet::Result<()> {
         if self.tp_version == options::OptTpacketVersion::TpacketVersion2 {
             let mut req: header::TpacketReq = Default::default();
             req.tp_block_nr = self.opts.num_blocks;
@@ -185,11 +180,11 @@ impl Tpacket {
                 .setsockopt(SOL_PACKET, PACKET_RX_RING, req)?;
             Ok(())
         } else {
-            Err(Error::InvalidTpVersion(self.tp_version as isize))
+            Err(af_packet::Error::InvalidTpVersion(self.tp_version as isize))
         }
     }
 
-    fn mmap_ring(&mut self) -> Result<()> {
+    fn mmap_ring(&mut self) -> af_packet::Result<()> {
         // 接收队列
         unsafe {
             let ret = mmap(
@@ -261,7 +256,7 @@ impl Tpacket {
         return false;
     }
 
-    pub fn read(&mut self) -> Option<Packet> {
+    pub fn read(&mut self) -> Option<packet::Packet> {
         if self.current.is_none()
             || !self.header_next_needed
             || !self.current.as_mut().unwrap().next()
@@ -287,7 +282,7 @@ impl Tpacket {
             }
         }
         if let Some(x) = self.current.as_ref() {
-            let packet = Packet {
+            let packet = packet::Packet {
                 timestamp: x.get_time(),
                 if_index: x.get_iface_index(),
                 data: x.get_data(),
@@ -299,7 +294,7 @@ impl Tpacket {
         return None;
     }
 
-    pub fn set_bpf(&self, syntax: &CStr) -> Result<()> {
+    pub fn set_bpf(&self, syntax: &CStr) -> af_packet::Result<()> {
         let mut prog: bpf_program = bpf_program {
             bf_len: 0,
             bf_insns: std::ptr::null_mut(),

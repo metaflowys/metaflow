@@ -29,11 +29,16 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 
 use super::{
-    error::Result,
-    recv_engine::{self, af_packet::Packet, bpf, RecvEngine},
+    error::{Error, Result},
+    recv_engine::{self, bpf, RecvEngine},
     BpfOptions, Options, PacketCounter, Pipeline,
 };
 
+#[cfg(target_os = "windows")]
+use windows_dispatcher::WinPacket;
+
+#[cfg(target_os = "linux")]
+use crate::platform::GenericPoller;
 use crate::{
     common::{
         decapsulate::{TunnelInfo, TunnelType, TunnelTypeBitmap},
@@ -44,7 +49,6 @@ use crate::{
     config::{handler::FlowAccess, DispatcherConfig},
     exception::ExceptionHandler,
     flow_generator::MetaAppProto,
-    platform::GenericPoller,
     policy::PolicyGetter,
     proto::trident::{Exception, IfMacSource, TapMode},
     rpc::get_timestamp,
@@ -56,6 +60,8 @@ use crate::{
         LeakyBucket,
     },
 };
+
+use public::packet;
 
 pub(super) struct BaseDispatcher {
     pub(super) engine: RecvEngine,
@@ -91,6 +97,7 @@ pub(super) struct BaseDispatcher {
     pub(super) counter: Arc<PacketCounter>,
     pub(super) terminated: Arc<AtomicBool>,
     pub(super) stats: Arc<Collector>,
+    #[cfg(target_os = "linux")]
     pub(super) platform_poller: Arc<GenericPoller>,
 
     pub(super) policy_getter: PolicyGetter,
@@ -100,6 +107,36 @@ pub(super) struct BaseDispatcher {
     // Enterprise Edition Feature: packet-sequence
     pub(super) packet_sequence_output_queue:
         DebugSender<Box<packet_sequence_block::PacketSequenceBlock>>,
+}
+
+impl BaseDispatcher {
+    #[cfg(target_os = "windows")]
+    pub(super) fn switch_recv_engine(&mut self, pcap_interfaces: Vec<Link>) -> Result<()> {
+        self.engine = if self.options.tap_mode == TapMode::Local {
+            if pcap_interfaces.is_empty() {
+                return Err(Error::WinPcap(
+                    "windows pcap capture must give interface to capture packet".into(),
+                ));
+            }
+            let src_ifaces = pcap_interfaces
+                .iter()
+                .map(|src_iface| (src_iface.device_name.as_str(), src_iface.if_index as isize))
+                .collect();
+            let win_packet = WinPacket::new(
+                src_ifaces,
+                self.options.win_packet_blocks,
+                self.options.snap_len,
+            )
+            .map_err(|e| Error::WinPcap(e.to_string()))?;
+            info!("WinPacket init");
+            self.need_update_bpf.store(true, Ordering::Relaxed);
+            RecvEngine::WinPcap(Some(win_packet))
+        } else {
+            todo!()
+        };
+
+        Ok(())
+    }
 }
 
 impl BaseDispatcher {
@@ -123,7 +160,7 @@ impl BaseDispatcher {
         prev_timestamp: &mut Duration,
         counter: &PacketCounter,
         ntp_diff: &AtomicI64,
-    ) -> Option<(Packet<'a>, Duration)> {
+    ) -> Option<(packet::Packet<'a>, Duration)> {
         let packet = engine.recv();
         if packet.is_err() {
             if let recv_engine::Error::Timeout = packet.unwrap_err() {
@@ -257,6 +294,7 @@ impl BaseDispatcher {
             pipelines: self.pipelines.clone(),
             tap_interfaces: self.tap_interfaces.clone(),
             need_update_bpf: self.need_update_bpf.clone(),
+            #[cfg(target_os = "linux")]
             platform_poller: self.platform_poller.clone(),
             capture_bpf: "".into(),
             proxy_controller_ip: Ipv4Addr::UNSPECIFIED.into(),
@@ -268,6 +306,27 @@ impl BaseDispatcher {
     pub fn terminate_queue(&self) {
         for sender in self.options.handler_builders.iter() {
             sender.send_terminated();
+        }
+    }
+
+    pub(super) fn check_and_update_bpf(&mut self) {
+        if !self.need_update_bpf.swap(false, Ordering::Relaxed) {
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        let tap_interfaces = self.tap_interfaces.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        if tap_interfaces.len() == 0 {
+            return;
+        }
+        let bpf_options = self.bpf_options.lock().unwrap();
+        info!("bpf set to: {}", bpf_options.bpf_syntax);
+        if let Err(e) = self
+            .engine
+            .set_bpf(&CString::new(&*bpf_options.bpf_syntax).unwrap())
+        {
+            warn!("set_bpf failed: {}", e);
         }
     }
 }
@@ -285,30 +344,26 @@ impl BaseDispatcher {
             }
             Err(e) => {
                 error!(
-                    "dispatcher recv_engine init error: {:?}, trident restart...",
+                    "dispatcher recv_engine init error: {:?}, metaflow-agent restart...",
                     e
                 );
                 thread::sleep(Duration::from_secs(1));
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     }
+}
 
-    pub(super) fn check_and_update_bpf(&mut self) {
-        if !self.need_update_bpf.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        let tap_interfaces = self.tap_interfaces.lock().unwrap();
-        if tap_interfaces.len() == 0 {
-            return;
-        }
-        let bpf_options = self.bpf_options.lock().unwrap();
-        info!("bpf set to: {}", bpf_options.bpf_syntax);
-        if let Err(e) = self
-            .engine
-            .set_bpf(&CString::new(&*bpf_options.bpf_syntax).unwrap())
-        {
-            warn!("set_bpf failed: {}", e);
+#[cfg(target_os = "windows")]
+impl BaseDispatcher {
+    pub(super) fn init(&mut self) {
+        if let Err(e) = self.engine.init() {
+            error!(
+                "dispatcher recv_engine init error: {:?}, metaflow-agent restart...",
+                e
+            );
+            thread::sleep(Duration::from_secs(1));
+            process::exit(1);
         }
     }
 }
@@ -406,15 +461,16 @@ pub(super) struct BaseDispatcherListener {
     pub pipelines: Arc<Mutex<HashMap<u32, Arc<Mutex<Pipeline>>>>>,
     pub tap_interfaces: Arc<Mutex<Vec<Link>>>,
     pub need_update_bpf: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
     pub platform_poller: Arc<GenericPoller>,
     pub tunnel_type_bitmap: Arc<Mutex<TunnelTypeBitmap>>,
-
     capture_bpf: String,
     proxy_controller_ip: IpAddr,
     analyzer_ip: IpAddr,
 }
 
 impl BaseDispatcherListener {
+    #[cfg(target_os = "linux")]
     fn on_afpacket_change(&mut self, config: &DispatcherConfig) {
         if self.options.af_packet_version != config.capture_socket_type.into() {
             // TODO：目前通过进程退出的方式修改AfPacket版本，后面需要支持动态修改
@@ -472,6 +528,7 @@ impl BaseDispatcherListener {
     }
 
     pub(super) fn on_config_change(&mut self, config: &DispatcherConfig) {
+        #[cfg(target_os = "linux")]
         self.on_afpacket_change(config);
         self.on_decap_type_change(config);
         self.on_bpf_change(config);
@@ -530,10 +587,7 @@ impl BaseDispatcherListener {
             info!("Adding VMs: {:?}", added);
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-impl BaseDispatcherListener {
     pub(super) fn on_tap_interface_change(&self, mut interfaces: Vec<Link>, _: IfMacSource) {
         if &self.src_interface != "" {
             match net::link_by_name(&self.src_interface) {

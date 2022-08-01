@@ -24,8 +24,11 @@ use log::{debug, info, log_enabled, warn};
 use regex::Regex;
 
 use super::base_dispatcher::{BaseDispatcher, BaseDispatcherListener};
+#[cfg(target_os = "windows")]
+use super::error::Result;
 
-use crate::utils::stats::{Countable, RefCountable, StatsOption};
+#[cfg(target_os = "linux")]
+use crate::platform::{GenericPoller, Poller};
 use crate::{
     common::{
         decapsulate::TunnelType,
@@ -34,9 +37,10 @@ use crate::{
     },
     config::DispatcherConfig,
     flow_generator::FlowMap,
-    platform::{GenericPoller, LibvirtXmlExtractor, Poller},
+    platform::LibvirtXmlExtractor,
     proto::{common::TridentType, trident::IfMacSource},
     rpc::get_timestamp,
+    utils::stats::{Countable, RefCountable, StatsOption},
     utils::{
         bytes::read_u16_be,
         net::{link_list, Link, MacAddr},
@@ -229,6 +233,12 @@ impl LocalModeDispatcher {
     pub(super) fn listener(&self) -> LocalModeDispatcherListener {
         LocalModeDispatcherListener::new(self.base.listener(), self.extractor.clone())
     }
+
+    /// Enterprise Edition Feature: windows-dispatcher
+    #[cfg(target_os = "windows")]
+    pub(super) fn switch_recv_engine(&mut self, pcap_interfaces: Vec<Link>) -> Result<()> {
+        self.base.switch_recv_engine(pcap_interfaces)
+    }
 }
 
 #[derive(Clone)]
@@ -304,6 +314,10 @@ impl LocalModeDispatcherListener {
         tap_mac_script: &str,
     ) -> Vec<MacAddr> {
         let mut macs = vec![];
+
+        #[cfg(target_os = "windows")]
+        let index_to_mac_map = Self::get_if_index_to_inner_mac_map();
+        #[cfg(target_os = "linux")]
         let index_to_mac_map = Self::get_if_index_to_inner_mac_map(&self.base.platform_poller);
         let name_to_mac_map = self.get_if_name_to_mac_map(tap_mac_script);
 
@@ -343,6 +357,29 @@ impl LocalModeDispatcherListener {
         macs
     }
 
+    #[cfg(target_os = "windows")]
+    fn get_if_index_to_inner_mac_map() -> HashMap<u32, MacAddr> {
+        let mut result = HashMap::new();
+
+        match link_list() {
+            Ok(links) => {
+                if result.len() == 0 {
+                    debug!("Poller Mac:");
+                }
+                for link in links {
+                    if link.mac_addr != MacAddr::ZERO && !result.contains_key(&link.if_index) {
+                        debug!("\tif_index: {}, mac: {}", link.if_index, link.mac_addr);
+                        result.insert(link.if_index, link.mac_addr);
+                    }
+                }
+            }
+            Err(e) => warn!("failed getting link list: {:?}", e),
+        }
+
+        result
+    }
+
+    #[cfg(target_os = "linux")]
     fn get_if_index_to_inner_mac_map(poller: &GenericPoller) -> HashMap<u32, MacAddr> {
         let mut result = HashMap::new();
 

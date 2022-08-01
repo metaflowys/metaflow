@@ -14,11 +14,15 @@
  * limitations under the License.
  */
 
+#[cfg(target_os = "linux")]
 use std::error::Error;
+#[cfg(target_os = "linux")]
 use std::ffi::CStr;
 use std::fmt;
 use std::mem;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(target_os = "linux")]
+use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,17 +32,20 @@ use pnet::packet::{
     tcp::{TcpOptionNumber, TcpOptionNumbers},
 };
 
+#[cfg(target_os = "linux")]
+use super::enums::TapType;
 use super::{
     consts::*,
     decapsulate::TunnelInfo,
     endpoint::EndpointData,
-    enums::{EthernetType, HeaderType, IpProtocol, PacketDirection, TapType, TcpFlags},
+    enums::{EthernetType, HeaderType, IpProtocol, PacketDirection, TcpFlags},
     flow::L7Protocol,
     lookup_key::LookupKey,
     policy::PolicyData,
     tap_port::TapPort,
 };
 
+#[cfg(target_os = "linux")]
 use crate::ebpf::{MSG_REQUEST, SK_BPF_DATA, SOCK_DIR_RCV, SOCK_DIR_SND};
 use crate::error;
 use crate::utils::net::{is_unicast_link_local, MacAddr};
@@ -754,6 +761,7 @@ impl<'a> MetaPacket<'a> {
         self.l4_payload_len
     }
 
+    #[cfg(target_os = "linux")]
     pub unsafe fn from_ebpf(
         data: *mut SK_BPF_DATA,
         capture_size: usize,

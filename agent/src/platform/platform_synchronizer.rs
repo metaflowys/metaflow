@@ -30,13 +30,10 @@ use log::{debug, error, info, warn};
 use ring::digest;
 use tokio::runtime::Runtime;
 
-use super::{
-    kubernetes::{
-        check_read_link_ns, check_set_ns, ActivePoller, GenericPoller, InterfaceInfo,
-        PassivePoller, Poller,
-    },
-    InterfaceEntry, LibvirtXmlExtractor,
+use super::kubernetes::{
+    check_read_link_ns, check_set_ns, ActivePoller, GenericPoller, PassivePoller, Poller,
 };
+use super::{InterfaceEntry, InterfaceInfo, LibvirtXmlExtractor};
 
 use crate::utils::command::*;
 use crate::{
@@ -102,42 +99,45 @@ impl PlatformSynchronizer {
         xml_extractor: Arc<LibvirtXmlExtractor>,
         exception_handler: ExceptionHandler,
     ) -> Self {
-        let (can_set_ns, can_read_link_ns) = (check_set_ns(), check_read_link_ns());
+        let (kubernetes_poller, sniffer) = {
+            let (can_set_ns, can_read_link_ns) = (check_set_ns(), check_read_link_ns());
 
-        if !can_set_ns || !can_read_link_ns {
-            warn!(
-                "kubernetes poller privileges: set_ns={} read_link_ns={}",
-                can_set_ns, can_read_link_ns
-            );
-        } else {
-            info!(
-                "kubernetes poller privileges: set_ns={} read_link_ns={}",
-                can_set_ns, can_read_link_ns
-            );
-        }
+            if !can_set_ns || !can_read_link_ns {
+                warn!(
+                    "kubernetes poller privileges: set_ns={} read_link_ns={}",
+                    can_set_ns, can_read_link_ns
+                );
+            } else {
+                info!(
+                    "kubernetes poller privileges: set_ns={} read_link_ns={}",
+                    can_set_ns, can_read_link_ns
+                );
+            }
 
-        let config_guard = config.load();
-        let poller = match config_guard.kubernetes_poller_type {
-            KubernetesPollerType::Adaptive => {
-                if can_set_ns && can_read_link_ns {
+            let config_guard = config.load();
+            let poller = match config_guard.kubernetes_poller_type {
+                KubernetesPollerType::Adaptive => {
+                    if can_set_ns && can_read_link_ns {
+                        GenericPoller::from(ActivePoller::new(config_guard.sync_interval))
+                    } else {
+                        GenericPoller::from(PassivePoller::new(config_guard.sync_interval))
+                    }
+                }
+                KubernetesPollerType::Active => {
                     GenericPoller::from(ActivePoller::new(config_guard.sync_interval))
-                } else {
+                }
+                KubernetesPollerType::Passive => {
                     GenericPoller::from(PassivePoller::new(config_guard.sync_interval))
                 }
-            }
-            KubernetesPollerType::Active => {
-                GenericPoller::from(ActivePoller::new(config_guard.sync_interval))
-            }
-            KubernetesPollerType::Passive => {
-                GenericPoller::from(PassivePoller::new(config_guard.sync_interval))
-            }
-        };
-        drop(config_guard);
+            };
+            drop(config_guard);
 
-        let kubernetes_poller = Arc::new(poller);
-        let mappings = mappings::Mappings;
-        mappings.set_kubernetes_poller(kubernetes_poller.clone());
-        let sniffer = Arc::new(sniffer_builder::Sniffer);
+            let kubernetes_poller = Arc::new(poller);
+            let mappings = mappings::Mappings;
+            mappings.set_kubernetes_poller(kubernetes_poller.clone());
+            let sniffer = Arc::new(sniffer_builder::Sniffer);
+            (kubernetes_poller, sniffer)
+        };
 
         Self {
             config,

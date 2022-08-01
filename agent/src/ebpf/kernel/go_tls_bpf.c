@@ -11,10 +11,22 @@ struct {
 	__uint(max_entries, MAX_SYSTEM_THREADS);
 } tls_conn_map SEC(".maps");
 
+struct http2_tcp_seq_key {
+	int tgid;
+	int fd;
+	__u32 tcp_seq_end;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct http2_tcp_seq_key);
+	__type(value, __u32);
+	__uint(max_entries, 1024);
+} http2_tcp_seq_map SEC(".maps");
+
 SEC("uprobe/go_tls_write_enter")
 int uprobe_go_tls_write_enter(struct pt_regs *ctx)
 {
-	return 0;
 	struct tls_conn c = {};
 	struct tls_conn_key key = {};
 
@@ -46,7 +58,6 @@ int uprobe_go_tls_write_enter(struct pt_regs *ctx)
 SEC("uprobe/go_tls_write_exit")
 int uprobe_go_tls_write_exit(struct pt_regs *ctx)
 {
-	return 0;
 	struct tls_conn *c;
 	struct tls_conn_key key = {};
 	ssize_t bytes_count;
@@ -90,7 +101,6 @@ out:
 SEC("uprobe/go_tls_read_enter")
 int uprobe_go_tls_read_enter(struct pt_regs *ctx)
 {
-	return 0;
 	struct tls_conn c = {};
 	struct tls_conn_key key = {};
 
@@ -122,7 +132,6 @@ int uprobe_go_tls_read_enter(struct pt_regs *ctx)
 SEC("uprobe/go_tls_read_exit")
 int uprobe_go_tls_read_exit(struct pt_regs *ctx)
 {
-	return 0;
 	struct tls_conn *c;
 	struct tls_conn_key key = {};
 	ssize_t bytes_count;
@@ -133,6 +142,13 @@ int uprobe_go_tls_read_exit(struct pt_regs *ctx)
 	c = bpf_map_lookup_elem(&tls_conn_map, &key);
 	if (!c)
 		return 0;
+
+	struct http2_tcp_seq_key tcp_seq_key = {
+		.tgid = key.tgid,
+		.fd = c->fd,
+		.tcp_seq_end = get_tcp_read_seq_from_fd(c->fd),
+	};
+	bpf_map_update_elem(&http2_tcp_seq_map, &tcp_seq_key, &c->tcp_seq, BPF_NOEXIST);
 
 	if (get_go_version() >= GO_VERSION(1, 17, 0)) {
 		bytes_count = ctx->rax;

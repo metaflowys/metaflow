@@ -213,18 +213,28 @@ get_response_table_from_http2clientConnReadLoop_ctx(struct pt_regs *ctx)
 	return get_http2ClientConn_response_table(ptr);
 }
 
+static __inline __u32 get_previous_read_tcp_seq(int fd, __u32 seq_end)
+{
+	struct http2_tcp_seq_key key = {
+		.tgid = bpf_get_current_pid_tgid() >> 32,
+		.fd = fd,
+		.tcp_seq_end = seq_end,
+	};
+	__u32 *seq_begin = bpf_map_lookup_elem(&http2_tcp_seq_map, &key);
+	if (seq_begin) {
+		return *seq_begin;
+	}
+	return 0;
+}
+
 // 日志上来看,调用多次 writeHeader 后调用一次 writeHeaders 进行发送
 // 可能可以把这两个联系起来完成功能
 SEC("uprobe/go_http2ClientConn_writeHeader")
 int uprobe_go_http2ClientConn_writeHeader(struct pt_regs *ctx)
 {
-	// 看样子不需要这个hook点,临时屏蔽掉
-	return 0;
 	int fd = get_fd_from_http2ClientConn_ctx(ctx);
 	int tcp_seq = get_tcp_write_seq_from_fd(fd);
-	bpf_debug("===== 0 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-
-	// TODO: Implement hook function
+	bpf_debug("http2 client write fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }
 
@@ -233,12 +243,7 @@ int uprobe_go_http2ClientConn_writeHeaders(struct pt_regs *ctx)
 {
 	int fd = get_fd_from_http2ClientConn_ctx(ctx);
 	int tcp_seq = get_tcp_write_seq_from_fd(fd);
-	bpf_debug("===== 1 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-
-	// 在这里把动态表打印出来
-	void *ptr = get_request_table_from_http2ClientConn_ctx(ctx);
-	update_dynamic_table(ptr);
-	// TODO: Implement hook function
+	bpf_debug("http2 client write fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }
 
@@ -248,10 +253,8 @@ int uprobe_go_http2serverConn_processHeaders(struct pt_regs *ctx)
 {
 	int fd = get_fd_from_http2serverConn_ctx(ctx);
 	int tcp_seq = get_tcp_read_seq_from_fd(fd);
-	bpf_debug("===== 2 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-	void *ptr = get_request_table_from_http2serverConn_ctx(ctx);
-	update_dynamic_table(ptr);
-	// TODO: Implement hook function
+	tcp_seq = get_previous_read_tcp_seq(fd, tcp_seq);
+	bpf_debug("http2 server read fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }
 
@@ -261,10 +264,7 @@ int uprobe_go_http2serverConn_writeHeaders(struct pt_regs *ctx)
 {
 	int fd = get_fd_from_http2serverConn_ctx(ctx);
 	int tcp_seq = get_tcp_write_seq_from_fd(fd);
-	bpf_debug("===== 3 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-	void *ptr = get_response_table_from_http2serverConn_ctx(ctx);
-	update_dynamic_table(ptr);
-	// TODO: Implement hook function
+	bpf_debug("http2 server write fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }
 
@@ -273,11 +273,8 @@ int uprobe_go_http2clientConnReadLoop_handleResponse(struct pt_regs *ctx)
 {
 	int fd = get_fd_from_http2clientConnReadLoop_ctx(ctx);
 	int tcp_seq = get_tcp_read_seq_from_fd(fd);
-	bpf_debug("===== 4 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-
-	void *ptr = get_response_table_from_http2clientConnReadLoop_ctx(ctx);
-	update_dynamic_table(ptr);
-	// TODO: Implement hook function
+	tcp_seq = get_previous_read_tcp_seq(fd, tcp_seq);
+	bpf_debug("http2 client read fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }
 
@@ -286,9 +283,8 @@ int uprobe_go_http2Server_operateHeaders(struct pt_regs *ctx)
 {
 	int fd = get_fd_from_grpc_http2Server_ctx(ctx);
 	int tcp_seq = get_tcp_read_seq_from_fd(fd);
-	bpf_debug("===== 6 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-
-	// TODO: Implement hook function
+	tcp_seq = get_previous_read_tcp_seq(fd, tcp_seq);
+	bpf_debug("grpc server read fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }
 
@@ -299,12 +295,10 @@ int uprobe_go_loopyWriter_writeHeader(struct pt_regs *ctx)
 	int tcp_seq = get_tcp_write_seq_from_fd(fd);
 	int side = get_side_from_grpc_loopyWriter(ctx);
 	if (side == 0) {
-		bpf_debug("===== 5 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
+		bpf_debug("grpc client write fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	} else {
-		bpf_debug("===== 7 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
+		bpf_debug("grpc server write fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	}
-
-	// TODO: Implement hook function
 	return 0;
 }
 
@@ -313,8 +307,7 @@ int uprobe_go_http2Client_operateHeaders(struct pt_regs *ctx)
 {
 	int fd = get_fd_from_grpc_http2Client_ctx(ctx);
 	int tcp_seq = get_tcp_read_seq_from_fd(fd);
-	bpf_debug("===== 8 ===== fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
-
-	// TODO: Implement hook function
+	tcp_seq = get_previous_read_tcp_seq(fd, tcp_seq);
+	bpf_debug("grpc client read fd=[%d] tcp_seq=[%u]\n", fd, tcp_seq);
 	return 0;
 }

@@ -31,8 +31,11 @@ use hyper::{
     Body, Method, Request, Response, Server, StatusCode,
 };
 use log::{error, info, warn};
-use tokio::runtime::{Builder, Runtime};
-use tokio::task::JoinHandle;
+use tokio::{
+    runtime::{Builder, Runtime},
+    sync::oneshot,
+    task::JoinHandle,
+};
 
 use crate::config::handler::MetricServerAccess;
 use crate::exception::ExceptionHandler;
@@ -211,6 +214,7 @@ pub struct MetricServer {
     telegraf_sender: DebugSender<SendItem>,
     conf: MetricServerAccess,
     exception_handler: ExceptionHandler,
+    server_terminator: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl MetricServer {
@@ -234,6 +238,7 @@ impl MetricServer {
             telegraf_sender,
             conf,
             exception_handler,
+            server_terminator: Default::default(),
         }
     }
 
@@ -251,6 +256,9 @@ impl MetricServer {
         let prometheus_sender = self.prometheus_sender.clone();
         let telegraf_sender = self.telegraf_sender.clone();
         let exception_handler = self.exception_handler.clone();
+        let running = self.running.clone();
+        let (tx, rx) = oneshot::channel();
+        self.server_terminator.lock().unwrap().replace(tx);
 
         self.thread
             .lock()
@@ -259,6 +267,9 @@ impl MetricServer {
                 info!("integration collector starting");
                 let mut max_tries = 0;
                 let server_builder = loop {
+                    if !running.load(Ordering::Relaxed) {
+                        return;
+                    }
                     match Server::try_bind(&addr) {
                         Ok(s) => break s,
                         Err(e) => {
@@ -300,7 +311,9 @@ impl MetricServer {
                     }
                 });
 
-                let server = server_builder.serve(service);
+                let server = server_builder.serve(service).with_graceful_shutdown(async {
+                    rx.await.ok();
+                });
 
                 info!("integration collector started");
                 info!("integration collector listening on http://{}", addr);
@@ -314,6 +327,10 @@ impl MetricServer {
     pub fn stop(&self) {
         if !self.running.swap(false, Ordering::Relaxed) {
             return;
+        }
+
+        if let Some(tx) = self.server_terminator.lock().unwrap().take() {
+            let _ = tx.send(());
         }
 
         if let Some(t) = self.thread.lock().unwrap().take() {

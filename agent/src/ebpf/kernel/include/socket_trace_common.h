@@ -110,8 +110,8 @@ struct trace_info_t {
 // struct member_offsets -> data[]  arrays index.
 enum offsets_index {
 	runtime_g_goid_offset = 0,
-	crypto_tls_conn_conn_offset = 1,
-	net_poll_fd_sysfd = 2,
+	crypto_tls_conn_conn_offset,
+	net_poll_fd_sysfd,
 	offsets_num,
 };
 
@@ -122,12 +122,28 @@ struct member_offsets {
 };
 
 enum {
-	EVENT_TYPE_PROC_EXEC = 128,
-	EVENT_TYPE_PROC_EXIT,
+	/*
+	 * 0 ~ 16 For struct socket_data_buffer,
+	 * indicates the number of events of socket L7 data.
+	 */
+
+	/*
+	 * For register events process. 
+	 */
+	EVENT_TYPE_MIN = 1 << 5,
+	EVENT_TYPE_PROC_EXEC = 1 << 5,
+	EVENT_TYPE_PROC_EXIT = 1 << 6
+	// Add register event types here.
 };
 
-struct event_data {
+// Description Provides basic information about an event 
+struct event_meta {
 	__u32 event_type;
+};
+
+// Process execution or exit event data 
+struct process_event_t {
+	struct event_meta meta;
 	__u32 pid; // process ID
 };
 

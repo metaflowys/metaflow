@@ -17,6 +17,7 @@
 package pool
 
 import (
+	"runtime/debug"
 	"sync/atomic"
 )
 
@@ -35,7 +36,7 @@ func (r *ReferenceCount) SubReferenceCount() bool {
 		return true
 	}
 	if *r != 0 {
-		log.Errorf("reference(%d) maybe double released", *r)
+		log.Errorf("reference(%d) maybe double released\n%s", *r, string(debug.Stack()))
 	}
 	return false
 }

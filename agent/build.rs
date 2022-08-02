@@ -14,7 +14,14 @@
  * limitations under the License.
  */
 
-use std::{env, error::Error, path::PathBuf, process::Command, str};
+use std::{
+    env,
+    error::Error,
+    fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+    str,
+};
 
 fn generate_protobuf() -> Result<(), Box<dyn Error>> {
     tonic_build::configure()
@@ -110,10 +117,32 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Enterprise Edition Feature: windows-dispatcher
+fn copy_dir(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
+    fs::remove_file(dst.as_ref()).ok();
+    fs::remove_dir_all(dst.as_ref()).ok();
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    if cfg!(target_os = "windows") {
+        copy_dir("../message", "src/proto/message")?; // copy the message because the Windows soft link is not invalid
+    }
     generate_protobuf()?;
     set_build_info()?;
-    set_build_libebpf()?;
-    set_linkage()?;
+    if cfg!(target_os = "linux") {
+        set_build_libebpf()?;
+        set_linkage()?;
+    }
     Ok(())
 }
